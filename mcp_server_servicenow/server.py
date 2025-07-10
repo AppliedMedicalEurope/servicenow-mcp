@@ -878,20 +878,29 @@ def create_oauth_auth(client_id: str, client_secret: str,
     """Create OAuthAuth object for ServiceNow authentication"""
     return OAuthAuth(client_id, client_secret, username, password, instance_url)
 
-from mcp.auth import allow_all  # ✅ works with mcp>=1.0.0
 
 
-# ✅ Load credentials from environment variables
-INSTANCE_URL = os.environ.get("SERVICENOW_INSTANCE_URL", "https://example.service-now.com")
-USERNAME = os.environ.get("SERVICENOW_USERNAME", "")
-PASSWORD = os.environ.get("SERVICENOW_PASSWORD", "")
 
-# ✅ Create auth + server
-auth = BasicAuth(USERNAME, PASSWORD)
-mcp_server = ServiceNowMCP(INSTANCE_URL, auth)
+try:
+    print("⚙️ Initializing ServiceNow MCP...")
+    
+    INSTANCE_URL = os.environ.get("SERVICENOW_INSTANCE_URL", "https://example.service-now.com")
+    USERNAME = os.environ.get("SERVICENOW_USERNAME", "")
+    PASSWORD = os.environ.get("SERVICENOW_PASSWORD", "")
 
-# ✅ Set optional open-access auth policy
-mcp_server.mcp.set_auth_provider(allow_all)
+    auth = BasicAuth(USERNAME, PASSWORD)
+    mcp_server = ServiceNowMCP(INSTANCE_URL, auth)
 
-# ✅ Expose the FastAPI app
-app = mcp_server.mcp.app
+    try:
+        from mcp.auth import allow_all
+        mcp_server.mcp.set_auth_provider(allow_all)
+    except ImportError:
+        print("⚠️ allow_all not available, skipping auth provider")
+
+    app = mcp_server.mcp.app
+
+    print("✅ MCP app initialized")
+
+except Exception as e:
+    print("❌ Failed to initialize MCP app:", str(e))
+    raise

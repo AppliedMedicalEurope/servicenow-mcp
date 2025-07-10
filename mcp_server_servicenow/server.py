@@ -883,7 +883,7 @@ def create_oauth_auth(client_id: str, client_secret: str,
 
 try:
     print("⚙️ Initializing ServiceNow MCP...")
-    
+
     INSTANCE_URL = os.environ.get("SERVICENOW_INSTANCE_URL", "https://example.service-now.com")
     USERNAME = os.environ.get("SERVICENOW_USERNAME", "")
     PASSWORD = os.environ.get("SERVICENOW_PASSWORD", "")
@@ -897,7 +897,8 @@ try:
     except ImportError:
         print("⚠️ allow_all not available, skipping auth provider")
 
-    app = mcp_server.mcp.app
+    # ✅ FIXED: use get_app()
+    app = mcp_server.mcp.get_app()
 
     print("✅ MCP app initialized")
 

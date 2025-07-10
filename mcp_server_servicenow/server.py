@@ -897,8 +897,7 @@ try:
     except ImportError:
         print("⚠️ allow_all not available, skipping auth provider")
 
-    # ✅ FIXED: use get_app()
-    app = mcp_server.mcp.get_app()
+   app = mcp_server.mcp.fastapi_app
 
     print("✅ MCP app initialized")
 

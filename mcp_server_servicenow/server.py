@@ -877,3 +877,5 @@ def create_oauth_auth(client_id: str, client_secret: str,
                      instance_url: str) -> OAuthAuth:
     """Create OAuthAuth object for ServiceNow authentication"""
     return OAuthAuth(client_id, client_secret, username, password, instance_url)
+
+app = create_app()

@@ -890,7 +890,7 @@ try:
 
     auth = BasicAuth(USERNAME, PASSWORD)
     mcp_server = ServiceNowMCP(INSTANCE_URL, auth)
-
+    print("MCP attributes:", dir(mcp_server.mcp))
     try:
         from mcp.auth import allow_all
         mcp_server.mcp.set_auth_provider(allow_all)

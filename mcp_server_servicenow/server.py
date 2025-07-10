@@ -878,7 +878,8 @@ def create_oauth_auth(client_id: str, client_secret: str,
     """Create OAuthAuth object for ServiceNow authentication"""
     return OAuthAuth(client_id, client_secret, username, password, instance_url)
 
-from mcp.server.fastmcp.utilities.auth import allow_all
+from mcp.auth import allow_all  # ✅ works with mcp>=1.0.0
+
 
 # ✅ Load credentials from environment variables
 INSTANCE_URL = os.environ.get("SERVICENOW_INSTANCE_URL", "https://example.service-now.com")

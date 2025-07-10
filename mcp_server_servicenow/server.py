@@ -896,8 +896,10 @@ try:
         mcp_server.mcp.set_auth_provider(allow_all)
     except ImportError:
         print("⚠️ allow_all not available, skipping auth provider")
+    
+    print("🧪 MCP methods/attributes:", dir(mcp_server.mcp))
 
-   app = mcp_server.mcp.fastapi_app
+    app = mcp_server.mcp.fastapi_app
 
     print("✅ MCP app initialized")
 

@@ -897,8 +897,7 @@ try:
     except ImportError:
         print("⚠️ allow_all not available, skipping auth provider")
 
-    # ✅ Correctly get the ASGI app
-    app = mcp_server.mcp.asgi()
+    app = mcp_server.mcp.sse_app
 
     print("✅ MCP app initialized")
 

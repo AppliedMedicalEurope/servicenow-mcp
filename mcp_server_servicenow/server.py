@@ -569,7 +569,14 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
                 ])
                 return
 
-            await mcp_app(scope, receive, send)
+            # FastMCP validates the Host header against its allowed-hosts list,
+            # which defaults to localhost only. We've already authenticated the
+            # request, so rewrite the Host header to localhost before forwarding.
+            fixed_headers = [
+                (b"host", b"localhost") if name == b"host" else (name, value)
+                for name, value in scope.get("headers", [])
+            ]
+            await mcp_app({**scope, "headers": fixed_headers}, receive, send)
 
         except Exception as exc:
             print(f"[MCP-Auth] EXCEPTION: {exc}", flush=True)

@@ -1,4 +1,8 @@
 {
-  "start": "uvicorn main:app --host 0.0.0.0 --port 8000"
+  "$schema": "https://railway.app/railway.schema.json",
+  "deploy": {
+    "healthcheckPath": "/health",
+    "startCommand": "uvicorn mcp_server_servicenow.server:app --host=0.0.0.0 --port=$PORT"
+  }
 }
 

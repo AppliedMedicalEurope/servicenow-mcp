@@ -569,14 +569,7 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
                 ])
                 return
 
-            # FastMCP validates the Host header against its allowed-hosts list,
-            # which defaults to localhost only. We've already authenticated the
-            # request, so rewrite the Host header to localhost before forwarding.
-            fixed_headers = [
-                (b"host", b"localhost") if name == b"host" else (name, value)
-                for name, value in scope.get("headers", [])
-            ]
-            await mcp_app({**scope, "headers": fixed_headers}, receive, send)
+            await mcp_app(scope, receive, send)
 
         except Exception as exc:
             print(f"[MCP-Auth] EXCEPTION: {exc}", flush=True)
@@ -604,11 +597,20 @@ class ServiceNowMCP:
         self.server_client_id = server_client_id
         self.server_client_secret = server_client_secret
         self.server_url = server_url
-        self.mcp = FastMCP(name, dependencies=[
-            "requests",
-            "httpx", 
-            "pydantic"
-        ])
+        # Disable FastMCP's DNS-rebinding protection so it accepts requests
+        # forwarded from Railway's edge (Host header won't be localhost).
+        # Auth is enforced at the protected_app layer above.
+        try:
+            from mcp.server.transport_security import TransportSecuritySettings
+            _transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        except Exception:
+            _transport_security = None
+
+        _fastmcp_kwargs: dict = {"dependencies": ["requests", "httpx", "pydantic"]}
+        if _transport_security is not None:
+            _fastmcp_kwargs["transport_security"] = _transport_security
+
+        self.mcp = FastMCP(name, **_fastmcp_kwargs)
         
         # Register resources
         self.mcp.resource("servicenow://incidents")(self.list_incidents)

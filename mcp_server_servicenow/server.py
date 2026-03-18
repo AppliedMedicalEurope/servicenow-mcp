@@ -10,12 +10,22 @@ import json
 import asyncio
 import logging
 import re
+import base64
+import hashlib
+import hmac
+import time
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Any, Union, Literal, Tuple
 
 import requests
 import httpx
+import uvicorn
+from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route, Mount
 from pydantic import BaseModel, Field, field_validator
 
 from mcp_server_servicenow.nlp import NLPProcessor
@@ -309,14 +319,120 @@ class ScriptUpdateModel(BaseModel):
     type: str = Field(..., description="The type of script (e.g., sys_script_include)")
     description: Optional[str] = Field(None, description="Description of the script")
 
+def _make_signed_token(client_id: str, signing_key: bytes, ttl: int = 3600) -> str:
+    """Generate a signed Bearer token valid for ttl seconds."""
+    expiry = int(time.time()) + ttl
+    payload = f"{client_id}:{expiry}".encode()
+    sig = hmac.new(signing_key, payload, hashlib.sha256).digest()
+    payload_enc = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    sig_enc = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+    return f"{payload_enc}.{sig_enc}"
+
+
+def _verify_signed_token(token: str, signing_key: bytes) -> Optional[str]:
+    """Verify a signed Bearer token. Returns client_id if valid, None otherwise."""
+    try:
+        payload_enc, sig_enc = token.rsplit(".", 1)
+        payload = base64.urlsafe_b64decode(payload_enc + "==")
+        sig = base64.urlsafe_b64decode(sig_enc + "==")
+        expected = hmac.new(signing_key, payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        client_id, expiry_str = payload.decode().rsplit(":", 1)
+        if int(time.time()) > int(expiry_str):
+            return None
+        return client_id
+    except Exception:
+        return None
+
+
+def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str, server_url: str) -> Any:
+    """Wrap an MCP SSE ASGI app with OAuth 2.0 client credentials protection.
+
+    Adds:
+      GET  /.well-known/oauth-authorization-server  — OAuth discovery
+      POST /oauth/token                             — issues Bearer tokens
+      All other paths require Authorization: Bearer <token>
+    """
+    server_url = server_url.rstrip("/")
+    signing_key = hashlib.sha256(f"mcp-token-signing:{client_secret}".encode()).digest()
+    secret_digest = hashlib.sha256(client_secret.encode()).digest()
+
+    _EXEMPT = frozenset(["/.well-known/oauth-authorization-server", "/oauth/token", "/health"])
+
+    async def metadata_endpoint(request: Request) -> JSONResponse:
+        return JSONResponse({
+            "issuer": server_url,
+            "token_endpoint": f"{server_url}/oauth/token",
+            "grant_types_supported": ["client_credentials"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        })
+
+    async def token_endpoint(request: Request) -> JSONResponse:
+        form = await request.form()
+        grant_type = str(form.get("grant_type", ""))
+        supplied_id = str(form.get("client_id", ""))
+        supplied_secret = str(form.get("client_secret", ""))
+
+        if grant_type != "client_credentials":
+            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+        id_ok = hmac.compare_digest(supplied_id.encode(), client_id.encode())
+        secret_ok = hmac.compare_digest(
+            hashlib.sha256(supplied_secret.encode()).digest(),
+            secret_digest,
+        )
+        if not (id_ok and secret_ok):
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+        token = _make_signed_token(client_id, signing_key)
+        return JSONResponse({
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": 3600,
+        })
+
+    class _BearerAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            if request.url.path in _EXEMPT:
+                return await call_next(request)
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return JSONResponse(
+                    {"error": "unauthorized"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": f'Bearer realm="{server_url}"'},
+                )
+            if _verify_signed_token(auth[len("Bearer "):], signing_key) is None:
+                return JSONResponse(
+                    {"error": "invalid_token"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+                )
+            return await call_next(request)
+
+    inner = Starlette(routes=[
+        Route("/.well-known/oauth-authorization-server", metadata_endpoint),
+        Route("/oauth/token", token_endpoint, methods=["POST"]),
+        Mount("/", app=mcp_app),
+    ])
+    return _BearerAuthMiddleware(inner)
+
+
 class ServiceNowMCP:
     """ServiceNow MCP Server"""
     
-    def __init__(self, 
+    def __init__(self,
                 instance_url: str,
                 auth: Authentication,
-                name: str = "ServiceNow MCP"):
+                name: str = "ServiceNow MCP",
+                server_client_id: Optional[str] = None,
+                server_client_secret: Optional[str] = None,
+                server_url: Optional[str] = None):
         self.client = ServiceNowClient(instance_url, auth)
+        self.server_client_id = server_client_id
+        self.server_client_secret = server_client_secret
+        self.server_url = server_url
         self.mcp = FastMCP(name, dependencies=[
             "requests",
             "httpx", 
@@ -354,10 +470,21 @@ class ServiceNowMCP:
         """Close the ServiceNow client"""
         await self.client.close()
         
-    def run(self, transport: str = "stdio"):
+    def run(self, transport: str = "stdio", host: str = "0.0.0.0", port: int = 8000):
         """Run the ServiceNow MCP server"""
         try:
-            self.mcp.run(transport=transport)
+            if transport == "sse" and self.server_client_id and self.server_client_secret:
+                server_url = self.server_url or f"http://{host}:{port}"
+                protected = create_oauth_protected_app(
+                    self.mcp.sse_app,
+                    self.server_client_id,
+                    self.server_client_secret,
+                    server_url,
+                )
+                logger.info(f"MCP server with OAuth protection starting at {server_url}")
+                uvicorn.run(protected, host=host, port=port)
+            else:
+                self.mcp.run(transport=transport)
         finally:
             asyncio.run(self.close())
         
@@ -888,18 +1015,24 @@ try:
     USERNAME = os.environ.get("SERVICENOW_USERNAME", "")
     PASSWORD = os.environ.get("SERVICENOW_PASSWORD", "")
 
+    _SERVER_CLIENT_ID = os.environ.get("MCP_SERVER_CLIENT_ID")
+    _SERVER_CLIENT_SECRET = os.environ.get("MCP_SERVER_CLIENT_SECRET")
+    _SERVER_URL = os.environ.get("MCP_SERVER_URL", "")
+
     auth = BasicAuth(USERNAME, PASSWORD)
     mcp_server = ServiceNowMCP(INSTANCE_URL, auth)
-    print("MCP attributes:", dir(mcp_server.mcp))
-    try:
-        from mcp.auth import allow_all
-        mcp_server.mcp.set_auth_provider(allow_all)
-    except ImportError:
-        print("⚠️ allow_all not available, skipping auth provider")
 
-    app = mcp_server.mcp.sse_app
-
-    print("✅ MCP app initialized")
+    if _SERVER_CLIENT_ID and _SERVER_CLIENT_SECRET:
+        app = create_oauth_protected_app(
+            mcp_server.mcp.sse_app,
+            _SERVER_CLIENT_ID,
+            _SERVER_CLIENT_SECRET,
+            _SERVER_URL,
+        )
+        print("✅ MCP app initialized with OAuth protection")
+    else:
+        app = mcp_server.mcp.sse_app
+        print("⚠️  MCP app initialized WITHOUT auth — set MCP_SERVER_CLIENT_ID and MCP_SERVER_CLIENT_SECRET to protect this endpoint")
 
 except Exception as e:
     print("❌ Failed to initialize MCP app:", str(e))

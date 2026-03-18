@@ -32,6 +32,8 @@ dependencies = [
     "requests>=2.31.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
+    "starlette>=0.25.0",
+    "uvicorn>=0.20.0",
 ]
 
 [project.optional-dependencies]

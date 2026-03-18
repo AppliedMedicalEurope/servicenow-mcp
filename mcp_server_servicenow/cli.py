@@ -19,14 +19,22 @@ def main():
     parser = argparse.ArgumentParser(description="ServiceNow MCP Server")
     parser.add_argument("--url", help="ServiceNow instance URL", default=os.environ.get("SERVICENOW_INSTANCE_URL"))
     parser.add_argument("--transport", help="Transport protocol (stdio or sse)", default="stdio", choices=["stdio", "sse"])
-    
-    # Authentication options
-    auth_group = parser.add_argument_group("Authentication")
+    parser.add_argument("--host", help="Host to bind (SSE only)", default=os.environ.get("MCP_HOST", "0.0.0.0"))
+    parser.add_argument("--port", help="Port to bind (SSE only)", type=int, default=int(os.environ.get("MCP_PORT", "8000")))
+
+    # ServiceNow authentication
+    auth_group = parser.add_argument_group("ServiceNow Authentication")
     auth_group.add_argument("--username", help="ServiceNow username", default=os.environ.get("SERVICENOW_USERNAME"))
     auth_group.add_argument("--password", help="ServiceNow password", default=os.environ.get("SERVICENOW_PASSWORD"))
     auth_group.add_argument("--token", help="ServiceNow token", default=os.environ.get("SERVICENOW_TOKEN"))
-    auth_group.add_argument("--client-id", help="OAuth client ID", default=os.environ.get("SERVICENOW_CLIENT_ID"))
-    auth_group.add_argument("--client-secret", help="OAuth client secret", default=os.environ.get("SERVICENOW_CLIENT_SECRET"))
+    auth_group.add_argument("--client-id", help="ServiceNow OAuth client ID", default=os.environ.get("SERVICENOW_CLIENT_ID"))
+    auth_group.add_argument("--client-secret", help="ServiceNow OAuth client secret", default=os.environ.get("SERVICENOW_CLIENT_SECRET"))
+
+    # MCP server protection (SSE only)
+    server_auth = parser.add_argument_group("MCP Server Auth (SSE only)")
+    server_auth.add_argument("--server-client-id", help="Client ID required to connect to this server", default=os.environ.get("MCP_SERVER_CLIENT_ID"))
+    server_auth.add_argument("--server-client-secret", help="Client secret required to connect to this server", default=os.environ.get("MCP_SERVER_CLIENT_SECRET"))
+    server_auth.add_argument("--server-url", help="Public URL of this server (used in OAuth metadata)", default=os.environ.get("MCP_SERVER_URL"))
     
     args = parser.parse_args()
     
@@ -52,8 +60,14 @@ def main():
         sys.exit(1)
     
     # Create and run the server
-    server = ServiceNowMCP(instance_url=args.url, auth=auth)
-    server.run(transport=args.transport)
+    server = ServiceNowMCP(
+        instance_url=args.url,
+        auth=auth,
+        server_client_id=args.server_client_id,
+        server_client_secret=args.server_client_secret,
+        server_url=args.server_url,
+    )
+    server.run(transport=args.transport, host=args.host, port=args.port)
 
 if __name__ == "__main__":
     main()

@@ -409,14 +409,26 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
         return hmac.compare_digest(expected, code_challenge)
 
     async def protected_app(scope, receive, send):
-        try:
-            if scope["type"] != "http":
-                await mcp_app(scope, receive, send)
-                return
+        # Lifespan must be handled OUTSIDE the HTTP try/except.
+        # If a lifespan exception were caught by the HTTP error handler, it would
+        # attempt to call _send_json() on a lifespan send channel, fail silently,
+        # and return — making uvicorn believe the server is shutting down.
+        if scope["type"] == "lifespan":
+            print("[MCP-Auth] lifespan delegating to mcp_app", flush=True)
+            await mcp_app(scope, receive, send)
+            print("[MCP-Auth] lifespan ended", flush=True)
+            return
 
-            path = scope.get("path", "")
-            method = scope.get("method", "GET")
-            print(f"[MCP-Auth] {method} {path}", flush=True)
+        # WebSocket and other non-HTTP scopes pass straight through.
+        if scope["type"] != "http":
+            await mcp_app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        method = scope.get("method", "GET")
+        print(f"[MCP-Auth] {method} {path}", flush=True)
+
+        try:
 
             # ── /.well-known/oauth-protected-resource (and any sub-path) ──────────
             if path.startswith("/.well-known/oauth-protected-resource"):

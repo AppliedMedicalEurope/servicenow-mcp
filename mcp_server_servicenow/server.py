@@ -375,68 +375,66 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
             if not msg.get("more_body", False):
                 return body
 
-    class _OAuthMCPApp:
-        async def __call__(self, scope, receive, send):
-            if scope["type"] != "http":
-                # Pass websocket / lifespan straight through
-                await mcp_app(scope, receive, send)
-                return
-
-            path = scope.get("path", "")
-
-            if path == "/.well-known/oauth-authorization-server":
-                await _send_json(send, 200, {
-                    "issuer": server_url,
-                    "token_endpoint": f"{server_url}/oauth/token",
-                    "grant_types_supported": ["client_credentials"],
-                    "token_endpoint_auth_methods_supported": ["client_secret_post"],
-                })
-                return
-
-            if path == "/oauth/token":
-                raw = await _read_body(receive)
-                params = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
-                grant_type = params.get("grant_type", "")
-                supplied_id = params.get("client_id", "")
-                supplied_secret = params.get("client_secret", "")
-
-                if grant_type != "client_credentials":
-                    await _send_json(send, 400, {"error": "unsupported_grant_type"})
-                    return
-
-                id_ok = hmac.compare_digest(supplied_id.encode(), client_id.encode())
-                secret_ok = hmac.compare_digest(
-                    hashlib.sha256(supplied_secret.encode()).digest(),
-                    secret_digest,
-                )
-                if not (id_ok and secret_ok):
-                    await _send_json(send, 401, {"error": "invalid_client"})
-                    return
-
-                token = _make_signed_token(client_id, signing_key)
-                await _send_json(send, 200, {"access_token": token, "token_type": "bearer", "expires_in": 3600})
-                return
-
-            if path == "/health":
-                await _send_json(send, 200, {"status": "ok"})
-                return
-
-            # All other paths — validate Bearer token
-            headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if not auth.startswith("Bearer "):
-                await _send_json(send, 401, {"error": "unauthorized"},
-                                 [(b"www-authenticate", f'Bearer realm="{server_url}"'.encode())])
-                return
-            if _verify_signed_token(auth[len("Bearer "):], signing_key) is None:
-                await _send_json(send, 401, {"error": "invalid_token"},
-                                 [(b"www-authenticate", b'Bearer error="invalid_token"')])
-                return
-
-            # Valid token — pass directly to MCP app (no buffering)
+    async def protected_app(scope, receive, send):
+        if scope["type"] != "http":
             await mcp_app(scope, receive, send)
+            return
 
-    return _OAuthMCPApp()
+        path = scope.get("path", "")
+        print(f"[MCP-Auth] {path}", flush=True)
+
+        if path == "/.well-known/oauth-authorization-server":
+            await _send_json(send, 200, {
+                "issuer": server_url,
+                "token_endpoint": f"{server_url}/oauth/token",
+                "grant_types_supported": ["client_credentials"],
+                "token_endpoint_auth_methods_supported": ["client_secret_post"],
+            })
+            return
+
+        if path == "/oauth/token":
+            raw = await _read_body(receive)
+            params = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
+            grant_type = params.get("grant_type", "")
+            supplied_id = params.get("client_id", "")
+            supplied_secret = params.get("client_secret", "")
+
+            if grant_type != "client_credentials":
+                await _send_json(send, 400, {"error": "unsupported_grant_type"})
+                return
+
+            id_ok = hmac.compare_digest(supplied_id.encode(), client_id.encode())
+            secret_ok = hmac.compare_digest(
+                hashlib.sha256(supplied_secret.encode()).digest(),
+                secret_digest,
+            )
+            if not (id_ok and secret_ok):
+                await _send_json(send, 401, {"error": "invalid_client"})
+                return
+
+            token = _make_signed_token(client_id, signing_key)
+            await _send_json(send, 200, {"access_token": token, "token_type": "bearer", "expires_in": 3600})
+            return
+
+        if path == "/health":
+            await _send_json(send, 200, {"status": "ok"})
+            return
+
+        # All other paths — validate Bearer token
+        headers = dict(scope.get("headers", []))
+        auth = headers.get(b"authorization", b"").decode()
+        if not auth.startswith("Bearer "):
+            await _send_json(send, 401, {"error": "unauthorized"},
+                             [(b"www-authenticate", f'Bearer realm="{server_url}"'.encode())])
+            return
+        if _verify_signed_token(auth[len("Bearer "):], signing_key) is None:
+            await _send_json(send, 401, {"error": "invalid_token"},
+                             [(b"www-authenticate", b'Bearer error="invalid_token"')])
+            return
+
+        await mcp_app(scope, receive, send)
+
+    return protected_app
 
 
 class ServiceNowMCP:

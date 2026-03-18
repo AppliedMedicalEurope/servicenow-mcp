@@ -13,6 +13,7 @@ import re
 import base64
 import hashlib
 import hmac
+import secrets
 import time
 from datetime import datetime
 from enum import Enum
@@ -342,30 +343,53 @@ def _verify_signed_token(token: str, signing_key: bytes) -> Optional[str]:
 
 
 def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str, server_url: str) -> Any:
-    """Wrap an MCP SSE ASGI app with OAuth 2.0 client credentials protection.
+    """Wrap an MCP SSE ASGI app with OAuth 2.0 authorization code + PKCE protection.
 
-    Adds:
-      GET  /.well-known/oauth-authorization-server  — OAuth discovery
-      POST /oauth/token                             — issues Bearer tokens
+    Implements the full MCP OAuth flow that Claude Desktop requires:
+      GET  /.well-known/oauth-protected-resource    — resource server metadata
+      GET  /.well-known/oauth-authorization-server  — auth server discovery
+      GET  /authorize                               — auto-approve, redirect with code
+      POST /token  (and /oauth/token)               — exchange code or client_credentials
       All other paths require Authorization: Bearer <token>
 
-    Uses a pure ASGI implementation so SSE streaming is never buffered.
+    Uses pure ASGI so SSE streaming is never buffered.
     """
-    from urllib.parse import parse_qs
+    from urllib.parse import parse_qs, urlencode, urlparse, parse_qsl
 
     server_url = server_url.rstrip("/")
     signing_key = hashlib.sha256(f"mcp-token-signing:{client_secret}".encode()).digest()
     secret_digest = hashlib.sha256(client_secret.encode()).digest()
 
-    _EXEMPT = frozenset(["/.well-known/oauth-authorization-server", "/oauth/token", "/health"])
+    # In-memory store for authorization codes: code -> {client_id, code_challenge, expires_at}
+    _auth_codes: Dict[str, dict] = {}
+
+    _EXEMPT_PREFIXES = (
+        "/.well-known/",
+        "/authorize",
+        "/token",
+        "/oauth/token",
+        "/health",
+    )
 
     async def _send_json(send, status: int, body: dict, extra_headers: list = None):
         data = json.dumps(body).encode()
-        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(data)).encode())]
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(data)).encode()),
+            (b"access-control-allow-origin", b"*"),
+        ]
         if extra_headers:
             headers.extend(extra_headers)
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": data, "more_body": False})
+
+    async def _send_redirect(send, location: str):
+        loc = location.encode()
+        await send({"type": "http.response.start", "status": 302, "headers": [
+            (b"location", loc),
+            (b"content-length", b"0"),
+        ]})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
 
     async def _read_body(receive) -> bytes:
         body = b""
@@ -375,64 +399,174 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
             if not msg.get("more_body", False):
                 return body
 
+    def _qs(scope) -> dict:
+        qs = scope.get("query_string", b"").decode()
+        return {k: v[0] for k, v in parse_qs(qs).items()} if qs else {}
+
+    def _pkce_verify(code_verifier: str, code_challenge: str) -> bool:
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return hmac.compare_digest(expected, code_challenge)
+
     async def protected_app(scope, receive, send):
-        if scope["type"] != "http":
-            await mcp_app(scope, receive, send)
-            return
+        try:
+            if scope["type"] != "http":
+                await mcp_app(scope, receive, send)
+                return
 
-        path = scope.get("path", "")
-        print(f"[MCP-Auth] {path}", flush=True)
+            path = scope.get("path", "")
+            method = scope.get("method", "GET")
+            print(f"[MCP-Auth] {method} {path}", flush=True)
 
-        if path == "/.well-known/oauth-authorization-server":
-            await _send_json(send, 200, {
-                "issuer": server_url,
-                "token_endpoint": f"{server_url}/oauth/token",
-                "grant_types_supported": ["client_credentials"],
-                "token_endpoint_auth_methods_supported": ["client_secret_post"],
-            })
-            return
+            # ── /.well-known/oauth-protected-resource (and any sub-path) ──────────
+            if path.startswith("/.well-known/oauth-protected-resource"):
+                await _send_json(send, 200, {
+                    "resource": server_url,
+                    "authorization_servers": [server_url],
+                })
+                return
 
-        if path == "/oauth/token":
-            raw = await _read_body(receive)
-            params = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
-            grant_type = params.get("grant_type", "")
-            supplied_id = params.get("client_id", "")
-            supplied_secret = params.get("client_secret", "")
+            # ── /.well-known/oauth-authorization-server ───────────────────────────
+            if path == "/.well-known/oauth-authorization-server":
+                await _send_json(send, 200, {
+                    "issuer": server_url,
+                    "authorization_endpoint": f"{server_url}/authorize",
+                    "token_endpoint": f"{server_url}/token",
+                    "grant_types_supported": ["authorization_code", "client_credentials"],
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
+                    "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+                })
+                return
 
-            if grant_type != "client_credentials":
+            # ── GET /authorize ────────────────────────────────────────────────────
+            if path == "/authorize" and method == "GET":
+                params = _qs(scope)
+                supplied_client_id = params.get("client_id", "")
+                redirect_uri = params.get("redirect_uri", "")
+                state = params.get("state", "")
+                code_challenge = params.get("code_challenge", "")
+                response_type = params.get("response_type", "")
+
+                if response_type != "code":
+                    await _send_json(send, 400, {"error": "unsupported_response_type"})
+                    return
+
+                if not hmac.compare_digest(supplied_client_id.encode(), client_id.encode()):
+                    await _send_json(send, 401, {"error": "invalid_client"})
+                    return
+
+                if not redirect_uri:
+                    await _send_json(send, 400, {"error": "invalid_request", "error_description": "redirect_uri required"})
+                    return
+
+                # Auto-approve: generate authorization code
+                code = secrets.token_urlsafe(32)
+                _auth_codes[code] = {
+                    "client_id": client_id,
+                    "code_challenge": code_challenge,
+                    "redirect_uri": redirect_uri,
+                    "expires_at": int(time.time()) + 300,
+                }
+
+                # Redirect back with code
+                sep = "&" if "?" in redirect_uri else "?"
+                location = f"{redirect_uri}{sep}code={code}"
+                if state:
+                    location += f"&state={state}"
+                print(f"[MCP-Auth] /authorize → redirecting with code", flush=True)
+                await _send_redirect(send, location)
+                return
+
+            # ── POST /token  or  /oauth/token ─────────────────────────────────────
+            if path in ("/token", "/oauth/token") and method == "POST":
+                raw = await _read_body(receive)
+                # Support both form-encoded body and query string
+                params = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
+                grant_type = params.get("grant_type", "")
+
+                if grant_type == "authorization_code":
+                    code = params.get("code", "")
+                    code_verifier = params.get("code_verifier", "")
+                    supplied_client_id = params.get("client_id", "")
+                    supplied_redirect_uri = params.get("redirect_uri", "")
+
+                    entry = _auth_codes.pop(code, None)
+                    if entry is None or int(time.time()) > entry["expires_at"]:
+                        await _send_json(send, 400, {"error": "invalid_grant", "error_description": "code expired or invalid"})
+                        return
+
+                    if not hmac.compare_digest(supplied_client_id.encode(), client_id.encode()):
+                        await _send_json(send, 401, {"error": "invalid_client"})
+                        return
+
+                    # PKCE verification (required when code_challenge was provided)
+                    code_challenge = entry.get("code_challenge", "")
+                    if code_challenge:
+                        if not code_verifier or not _pkce_verify(code_verifier, code_challenge):
+                            await _send_json(send, 400, {"error": "invalid_grant", "error_description": "PKCE verification failed"})
+                            return
+
+                    token = _make_signed_token(client_id, signing_key)
+                    await _send_json(send, 200, {
+                        "access_token": token,
+                        "token_type": "bearer",
+                        "expires_in": 3600,
+                    })
+                    return
+
+                if grant_type == "client_credentials":
+                    supplied_id = params.get("client_id", "")
+                    supplied_secret = params.get("client_secret", "")
+                    id_ok = hmac.compare_digest(supplied_id.encode(), client_id.encode())
+                    secret_ok = hmac.compare_digest(
+                        hashlib.sha256(supplied_secret.encode()).digest(),
+                        secret_digest,
+                    )
+                    if not (id_ok and secret_ok):
+                        await _send_json(send, 401, {"error": "invalid_client"})
+                        return
+                    token = _make_signed_token(client_id, signing_key)
+                    await _send_json(send, 200, {
+                        "access_token": token,
+                        "token_type": "bearer",
+                        "expires_in": 3600,
+                    })
+                    return
+
                 await _send_json(send, 400, {"error": "unsupported_grant_type"})
                 return
 
-            id_ok = hmac.compare_digest(supplied_id.encode(), client_id.encode())
-            secret_ok = hmac.compare_digest(
-                hashlib.sha256(supplied_secret.encode()).digest(),
-                secret_digest,
-            )
-            if not (id_ok and secret_ok):
-                await _send_json(send, 401, {"error": "invalid_client"})
+            # ── /health ───────────────────────────────────────────────────────────
+            if path == "/health":
+                await _send_json(send, 200, {"status": "ok"})
                 return
 
-            token = _make_signed_token(client_id, signing_key)
-            await _send_json(send, 200, {"access_token": token, "token_type": "bearer", "expires_in": 3600})
-            return
+            # ── All other paths: require Bearer token ─────────────────────────────
+            headers_dict = dict(scope.get("headers", []))
+            auth = headers_dict.get(b"authorization", b"").decode()
+            if not auth.startswith("Bearer "):
+                await _send_json(send, 401, {"error": "unauthorized"}, [
+                    (b"www-authenticate",
+                     f'Bearer realm="{server_url}", resource_metadata="{server_url}/.well-known/oauth-protected-resource"'.encode()),
+                ])
+                return
+            if _verify_signed_token(auth[len("Bearer "):], signing_key) is None:
+                await _send_json(send, 401, {"error": "invalid_token"}, [
+                    (b"www-authenticate", b'Bearer error="invalid_token"'),
+                ])
+                return
 
-        if path == "/health":
-            await _send_json(send, 200, {"status": "ok"})
-            return
+            await mcp_app(scope, receive, send)
 
-        # All other paths — validate Bearer token
-        headers = dict(scope.get("headers", []))
-        auth = headers.get(b"authorization", b"").decode()
-        if not auth.startswith("Bearer "):
-            await _send_json(send, 401, {"error": "unauthorized"},
-                             [(b"www-authenticate", f'Bearer realm="{server_url}"'.encode())])
-            return
-        if _verify_signed_token(auth[len("Bearer "):], signing_key) is None:
-            await _send_json(send, 401, {"error": "invalid_token"},
-                             [(b"www-authenticate", b'Bearer error="invalid_token"')])
-            return
-
-        await mcp_app(scope, receive, send)
+        except Exception as exc:
+            print(f"[MCP-Auth] EXCEPTION: {exc}", flush=True)
+            import traceback
+            traceback.print_exc()
+            try:
+                await _send_json(send, 500, {"error": "internal_server_error", "detail": str(exc)})
+            except Exception:
+                pass
 
     return protected_app
 

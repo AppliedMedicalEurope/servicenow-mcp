@@ -493,8 +493,12 @@ class ServiceNowMCP:
         try:
             if transport == "sse" and self.server_client_id and self.server_client_secret:
                 server_url = self.server_url or f"http://{host}:{port}"
+                import inspect as _inspect
+                _sse = self.mcp.sse_app
+                if _inspect.ismethod(_sse):
+                    _sse = _sse()
                 protected = create_oauth_protected_app(
-                    self.mcp.sse_app,
+                    _sse,
                     self.server_client_id,
                     self.server_client_secret,
                     server_url,
@@ -1040,16 +1044,24 @@ try:
     auth = BasicAuth(USERNAME, PASSWORD)
     mcp_server = ServiceNowMCP(INSTANCE_URL, auth)
 
+    # sse_app is a method in newer SDK versions — call it to get the ASGI app
+    import inspect as _inspect
+    _sse = mcp_server.mcp.sse_app
+    if _inspect.ismethod(_sse):
+        _sse = _sse()
+    print(f"[DEBUG] sse_app resolved to: {type(_sse).__name__}", flush=True)
+
     if _SERVER_CLIENT_ID and _SERVER_CLIENT_SECRET:
         app = create_oauth_protected_app(
-            mcp_server.mcp.sse_app,
+            _sse,
             _SERVER_CLIENT_ID,
             _SERVER_CLIENT_SECRET,
             _SERVER_URL,
         )
+        print(f"[DEBUG] final app: {type(app).__name__}", flush=True)
         print("✅ MCP app initialized with OAuth protection")
     else:
-        app = mcp_server.mcp.sse_app
+        app = _sse
         print("⚠️  MCP app initialized WITHOUT auth — set MCP_SERVER_CLIENT_ID and MCP_SERVER_CLIENT_SECRET to protect this endpoint")
 
 except Exception as e:

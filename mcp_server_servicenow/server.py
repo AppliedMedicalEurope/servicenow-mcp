@@ -21,11 +21,6 @@ from typing import Dict, List, Optional, Any, Union, Literal, Tuple
 import requests
 import httpx
 import uvicorn
-from starlette.applications import Starlette
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route, Mount
 from pydantic import BaseModel, Field, field_validator
 
 from mcp_server_servicenow.nlp import NLPProcessor
@@ -353,70 +348,95 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
       GET  /.well-known/oauth-authorization-server  — OAuth discovery
       POST /oauth/token                             — issues Bearer tokens
       All other paths require Authorization: Bearer <token>
+
+    Uses a pure ASGI implementation so SSE streaming is never buffered.
     """
+    from urllib.parse import parse_qs
+
     server_url = server_url.rstrip("/")
     signing_key = hashlib.sha256(f"mcp-token-signing:{client_secret}".encode()).digest()
     secret_digest = hashlib.sha256(client_secret.encode()).digest()
 
     _EXEMPT = frozenset(["/.well-known/oauth-authorization-server", "/oauth/token", "/health"])
 
-    async def metadata_endpoint(request: Request) -> JSONResponse:
-        return JSONResponse({
-            "issuer": server_url,
-            "token_endpoint": f"{server_url}/oauth/token",
-            "grant_types_supported": ["client_credentials"],
-            "token_endpoint_auth_methods_supported": ["client_secret_post"],
-        })
+    async def _send_json(send, status: int, body: dict, extra_headers: list = None):
+        data = json.dumps(body).encode()
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(data)).encode())]
+        if extra_headers:
+            headers.extend(extra_headers)
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": data, "more_body": False})
 
-    async def token_endpoint(request: Request) -> JSONResponse:
-        form = await request.form()
-        grant_type = str(form.get("grant_type", ""))
-        supplied_id = str(form.get("client_id", ""))
-        supplied_secret = str(form.get("client_secret", ""))
+    async def _read_body(receive) -> bytes:
+        body = b""
+        while True:
+            msg = await receive()
+            body += msg.get("body", b"")
+            if not msg.get("more_body", False):
+                return body
 
-        if grant_type != "client_credentials":
-            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    class _OAuthMCPApp:
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                # Pass websocket / lifespan straight through
+                await mcp_app(scope, receive, send)
+                return
 
-        id_ok = hmac.compare_digest(supplied_id.encode(), client_id.encode())
-        secret_ok = hmac.compare_digest(
-            hashlib.sha256(supplied_secret.encode()).digest(),
-            secret_digest,
-        )
-        if not (id_ok and secret_ok):
-            return JSONResponse({"error": "invalid_client"}, status_code=401)
+            path = scope.get("path", "")
 
-        token = _make_signed_token(client_id, signing_key)
-        return JSONResponse({
-            "access_token": token,
-            "token_type": "bearer",
-            "expires_in": 3600,
-        })
+            if path == "/.well-known/oauth-authorization-server":
+                await _send_json(send, 200, {
+                    "issuer": server_url,
+                    "token_endpoint": f"{server_url}/oauth/token",
+                    "grant_types_supported": ["client_credentials"],
+                    "token_endpoint_auth_methods_supported": ["client_secret_post"],
+                })
+                return
 
-    class _BearerAuthMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request: Request, call_next):
-            if request.url.path in _EXEMPT:
-                return await call_next(request)
-            auth = request.headers.get("Authorization", "")
+            if path == "/oauth/token":
+                raw = await _read_body(receive)
+                params = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
+                grant_type = params.get("grant_type", "")
+                supplied_id = params.get("client_id", "")
+                supplied_secret = params.get("client_secret", "")
+
+                if grant_type != "client_credentials":
+                    await _send_json(send, 400, {"error": "unsupported_grant_type"})
+                    return
+
+                id_ok = hmac.compare_digest(supplied_id.encode(), client_id.encode())
+                secret_ok = hmac.compare_digest(
+                    hashlib.sha256(supplied_secret.encode()).digest(),
+                    secret_digest,
+                )
+                if not (id_ok and secret_ok):
+                    await _send_json(send, 401, {"error": "invalid_client"})
+                    return
+
+                token = _make_signed_token(client_id, signing_key)
+                await _send_json(send, 200, {"access_token": token, "token_type": "bearer", "expires_in": 3600})
+                return
+
+            if path == "/health":
+                await _send_json(send, 200, {"status": "ok"})
+                return
+
+            # All other paths — validate Bearer token
+            headers = dict(scope.get("headers", []))
+            auth = headers.get(b"authorization", b"").decode()
             if not auth.startswith("Bearer "):
-                return JSONResponse(
-                    {"error": "unauthorized"},
-                    status_code=401,
-                    headers={"WWW-Authenticate": f'Bearer realm="{server_url}"'},
-                )
+                await _send_json(send, 401, {"error": "unauthorized"},
+                                 [(b"www-authenticate", f'Bearer realm="{server_url}"'.encode())])
+                return
             if _verify_signed_token(auth[len("Bearer "):], signing_key) is None:
-                return JSONResponse(
-                    {"error": "invalid_token"},
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
-                )
-            return await call_next(request)
+                await _send_json(send, 401, {"error": "invalid_token"},
+                                 [(b"www-authenticate", b'Bearer error="invalid_token"')])
+                return
 
-    inner = Starlette(routes=[
-        Route("/.well-known/oauth-authorization-server", metadata_endpoint),
-        Route("/oauth/token", token_endpoint, methods=["POST"]),
-        Mount("/", app=mcp_app),
-    ])
-    return _BearerAuthMiddleware(inner)
+            # Valid token — pass directly to MCP app (no buffering)
+            await mcp_app(scope, receive, send)
+
+    return _OAuthMCPApp()
 
 
 class ServiceNowMCP:

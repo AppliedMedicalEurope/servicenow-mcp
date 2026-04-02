@@ -315,7 +315,7 @@ class ScriptUpdateModel(BaseModel):
     type: str = Field(..., description="The type of script (e.g., sys_script_include)")
     description: Optional[str] = Field(None, description="Description of the script")
 
-def _make_signed_token(client_id: str, signing_key: bytes, ttl: int = 3600) -> str:
+def _make_signed_token(client_id: str, signing_key: bytes, ttl: int = 86400) -> str:
     """Generate a signed Bearer token valid for ttl seconds."""
     expiry = int(time.time()) + ttl
     payload = f"{client_id}:{expiry}".encode()
@@ -523,7 +523,7 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
                     await _send_json(send, 200, {
                         "access_token": token,
                         "token_type": "bearer",
-                        "expires_in": 3600,
+                        "expires_in": 86400,
                     })
                     return
 
@@ -542,7 +542,7 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
                     await _send_json(send, 200, {
                         "access_token": token,
                         "token_type": "bearer",
-                        "expires_in": 3600,
+                        "expires_in": 86400,
                     })
                     return
 
@@ -565,7 +565,8 @@ def create_oauth_protected_app(mcp_app: Any, client_id: str, client_secret: str,
                 return
             if _verify_signed_token(auth[len("Bearer "):], signing_key) is None:
                 await _send_json(send, 401, {"error": "invalid_token"}, [
-                    (b"www-authenticate", b'Bearer error="invalid_token"'),
+                    (b"www-authenticate",
+                     f'Bearer error="invalid_token", realm="{server_url}", resource_metadata="{server_url}/.well-known/oauth-protected-resource"'.encode()),
                 ])
                 return
 
